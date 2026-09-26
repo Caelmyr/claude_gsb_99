@@ -132,6 +132,7 @@ window.App = (function () {
   // 注入侧边栏与顶栏
   const NAV = [
     ["index.html", "📊", "总览"],
+    ["screen.html", "🖥️", "风险监控大屏"],
     ["rules.html", "📜", "规则配置"],
     ["flows.html", "🔀", "决策流设计"],
     ["events.html", "⚡", "实时事件流"],

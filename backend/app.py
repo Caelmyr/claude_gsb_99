@@ -10,6 +10,7 @@ from backend import config, auth, runtime
 from backend.engine.engine import RiskEngine
 from backend.flows import FlowStore
 from backend.settings_store import get_settings
+from backend.screen import ScreenAnalytics, backfill as screen_backfill
 
 # 全局 socket 实例（供 app.py 与测试使用）
 sock = Sock()
@@ -27,16 +28,26 @@ def create_app():
     # 运行时单例
     engine = RiskEngine(settings=get_settings())
     flows = FlowStore()
-    runtime.init(engine, flows)
+    screen = ScreenAnalytics()
+    engine.add_listener(screen.on_event)   # 大屏实时聚合作为旁路订阅者
+    runtime.init(engine, flows, screen)
 
     # 初始化样例数据（幂等）
     from backend import seed
     seed.seed_all(engine, flows)
 
+    # 大屏启动回补：近 24h 历史事件（dry-run 只读）+ 历史告警
+    try:
+        screen_backfill(engine, screen)
+    except Exception:
+        pass
+
     # ---- 注册 API 蓝图 ----
     from backend.api import (rules, events, alerts, stats, users,
-                             settings, sandbox, dict as dict_api, flows as flows_api)
-    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api, flows_api):
+                             settings, sandbox, dict as dict_api, flows as flows_api,
+                             screen as screen_api)
+    for module in (rules, events, alerts, stats, users, settings, sandbox,
+                   dict_api, flows_api, screen_api):
         app.register_blueprint(module.bp)
 
     # ---- 认证 ----

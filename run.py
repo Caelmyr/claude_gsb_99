@@ -18,6 +18,7 @@ def open_browser():
 
 
 PAGES = [
+    ("screen.html", "风险监控大屏"),
     ("index.html", "登录与总览"),
     ("rules.html", "规则配置"),
     ("flows.html", "决策流设计"),

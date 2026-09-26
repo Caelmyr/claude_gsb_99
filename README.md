@@ -9,6 +9,7 @@
 ### 前端（10 个页面，原生 HTML/CSS/JS）
 | 页面 | 路径 | 说明 |
 |------|------|------|
+| **风险监控大屏** | `screen.html` | 运营值守宽幅大屏：KPI 实时刷新、告警滚动播报、Top IP/用户、地域渠道分布、24h 趋势（WebSocket + 轮询） |
 | 登录 / 总览 | `index.html` | 登录认证、系统概览看板、关键指标 |
 | 规则配置 | `rules.html` | 规则 CRUD、CodeMirror JSON 编辑器、语法校验、启停 |
 | 决策流设计 | `flows.html` | 可视化拖拽节点（条件 / 动作 / 分支）编排决策流 |
@@ -44,6 +45,7 @@ gsb3/
 │   ├── flows.py               # 决策流编译与执行（条件/动作/分支）
 │   ├── settings_store.py      # 系统设置读写（深合并）
 │   ├── seed.py                # 样例数据初始化（10 条规则、字典、示例决策流，幂等）
+│   ├── screen.py              # 监控大屏内存滚动聚合：24h 趋势/分布/Top 榜/告警播报，启动 dry-run 回补
 │   ├── runtime.py             # 运行时单例引用
 │   ├── engine/
 │   │   ├── rule_parser.py     # 规则编译：条件编译、聚合规格、编译产物
@@ -54,6 +56,7 @@ gsb3/
 │   │   ├── alert.py           # 告警聚合去重（指纹哈希索引）
 │   │   └── engine.py          # 风控引擎编排：匹配→聚合→决策→去重→持久化→广播
 │   └── api/
+│       ├── screen.py          # 监控大屏：GET /api/screen/overview（24h 聚合快照）
 │       ├── rules.py           # 规则 CRUD、校验、版本、回滚
 │       ├── events.py          # 事件查询、摄取、模拟突发、存储统计
 │       ├── alerts.py          # 告警查询、标记、导出、统计
@@ -124,6 +127,7 @@ python run.py
 - 用户：`GET/POST /api/users`、`PUT/DELETE /api/users/<username>`、`POST /api/users/<username>/password`、`POST /api/users/me/password`
 - 设置：`GET/PUT /api/settings`
 - 字典：`GET /api/dict`、`POST /api/dict/entry`、`PUT/DELETE /api/dict/entry/<id>`、`POST /api/dict/category`
+- 监控大屏：`GET /api/screen/overview`（24h 滚动聚合快照：KPI/趋势/地域渠道分布/Top IP·用户/告警播报）
 - 实时：`WS /api/ws/events`
 
 

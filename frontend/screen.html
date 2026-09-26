@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>实时风险监控大屏 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/screen.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="screen">
+  <header>
+    <div class="h-left">
+      <span class="live-dot" id="live-dot"></span><span id="ws-status">连接中…</span>
+    </div>
+    <h1>实时风险监控大屏</h1>
+    <div class="h-right">
+      <span id="clock"></span>
+      <button class="h-btn" id="fs-btn">全屏</button>
+      <a class="h-btn" href="/index.html">管理后台</a>
+    </div>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi cyan"><div class="k-label">总事件量</div><div class="k-value" id="kpi-total">0</div><div class="k-hint">EVENTS / TOTAL</div></div>
+    <div class="kpi orange"><div class="k-label">命中量</div><div class="k-value" id="kpi-matched">0</div><div class="k-hint">RULE HITS</div></div>
+    <div class="kpi red"><div class="k-label">拦截量</div><div class="k-value" id="kpi-rejected">0</div><div class="k-hint">BLOCKED</div></div>
+    <div class="kpi purple"><div class="k-label">告警量</div><div class="k-value" id="kpi-alerted">0</div><div class="k-hint">ALERTS RAISED</div></div>
+    <div class="kpi"><div class="k-label">命中率</div><div class="k-value" id="kpi-hitrate">0%</div><div class="k-hint">HIT RATIO</div></div>
+    <div class="kpi green"><div class="k-label">拦截率</div><div class="k-value" id="kpi-rejectrate">0%</div><div class="k-hint">BLOCK RATIO</div></div>
+  </section>
+
+  <section class="main">
+    <div class="panel area-trend">
+      <div class="p-head">24 小时风险趋势<span class="p-extra">事件量 / 命中 / 拦截（按小时）</span></div>
+      <div class="p-body"><div class="chart" id="chart-trend"></div></div>
+    </div>
+    <div class="panel area-ticker">
+      <div class="p-head">告警实时播报<span class="p-extra" id="ticker-count"></span></div>
+      <div class="ticker" id="ticker"></div>
+    </div>
+    <div class="panel area-topip">
+      <div class="p-head">Top 风险 IP</div>
+      <div class="rk-list" id="top-ip"></div>
+    </div>
+    <div class="panel area-topuser">
+      <div class="p-head">Top 风险用户</div>
+      <div class="rk-list" id="top-user"></div>
+    </div>
+    <div class="panel area-dist">
+      <div class="p-head">事件分布<span class="p-extra">地域（左） · 渠道（右）</span></div>
+      <div class="p-body">
+        <div class="dist-split">
+          <div class="chart" id="chart-geo"></div>
+          <div class="chart" id="chart-channel"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const HOUR = 3600;
+const PALETTE = ["#22d3ee", "#3b82f6", "#a78bfa", "#f59e0b", "#34d399", "#f472b6", "#f87171", "#facc15"];
+
+/* 大屏状态：WS 推送做增量更新，定时拉取 /api/stats 与 /api/alerts 做权威校准 */
+const state = {
+  counters: { total: 0, matched: 0, rejected: 0, alerted: 0 },
+  trend: {},        // 小时时间戳 -> {total, matched, rejected}
+  geo: {},          // 国家/地区 -> 事件数
+  channel: {},      // 渠道 -> 事件数
+  topIp: {},        // ip -> {count, score}
+  topUser: {},      // user_id -> {count, score}
+  alerts: [],       // 播报列表，最新在前
+};
+
+const charts = {};
+function chart(id) {
+  if (!window.echarts) return null;
+  if (!charts[id]) charts[id] = echarts.init(document.getElementById(id));
+  return charts[id];
+}
+window.addEventListener("resize", () => Object.values(charts).forEach(c => c.resize()));
+
+function hourOf(ts) { return Math.floor(ts / HOUR) * HOUR; }
+function pad(n) { return String(n).padStart(2, "0"); }
+function fmtHM(ts) { const d = new Date(ts * 1000); return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()); }
+
+function addTop(map, key, count, score) {
+  const it = map[key] || (map[key] = { count: 0, score: 0 });
+  it.count += count;
+  it.score = Math.max(it.score, score || 0);
+}
+
+/* ---------------- 初始数据加载 ---------------- */
+async function syncStats() {
+  try {
+    const r = await API.get("/api/stats", { silent: true });
+    const c = r.stats.counters;
+    // 注：引擎在计数前将 reject 改写为 review，后端 rejected 计数恒为 0；
+    // 拦截量以本地按显示动作（reject/review）累计为准，校准时只增不减
+    state.counters = {
+      total: c.total, matched: c.matched, alerted: c.alerted,
+      rejected: Math.max(c.rejected || 0, state.counters.rejected),
+    };
+    // minute_series 的键带 -8h 偏移，还原到真实小时；
+    // total/matched 以后端为准，rejected 与本地累计取大（同上原因）
+    const series = r.stats.minute_series || {};
+    for (const k of Object.keys(series)) {
+      const m = series[k];
+      const h = hourOf(Number(k) + 8 * HOUR);
+      const local = state.trend[h] || {};
+      state.trend[h] = {
+        total: m.total, matched: m.matched,
+        rejected: Math.max(m.rejected || 0, local.rejected || 0),
+      };
+    }
+  } catch (e) { /* 静默，下轮重试 */ }
+}
+
+async function loadEvents() {
+  try {
+    const start = Date.now() / 1000 - 24 * HOUR;
+    const r = await API.get(`/api/events?start=${start}&limit=2000`, { silent: true });
+    for (const e of r.events || []) {
+      if (e.country) state.geo[e.country] = (state.geo[e.country] || 0) + 1;
+      if (e.channel) state.channel[e.channel] = (state.channel[e.channel] || 0) + 1;
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+async function loadAlerts() {
+  try {
+    const r = await API.get("/api/alerts?page=1&page_size=51", { silent: true });
+    const items = r.alerts || [];
+    state.topIp = {}; state.topUser = {};
+    for (const a of items) {
+      const sub = a.subject || {};
+      if (sub.ip) addTop(state.topIp, sub.ip, a.count || 1, a.max_risk_score);
+      if (sub.user_id) addTop(state.topUser, sub.user_id, a.count || 1, a.max_risk_score);
+    }
+    state.alerts = items.slice(0, 30).map(a => ({
+      ts: a.last_seen || a.first_seen,
+      level: a.level || "中",
+      title: a.rule_name || a.rule_id,
+      ip: (a.subject || {}).ip, user: (a.subject || {}).user_id,
+      count: a.count || 1,
+    }));
+    renderTicker();
+  } catch (e) { /* 静默 */ }
+}
+
+/* ---------------- WebSocket 实时通道 ---------------- */
+let ws = null;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/api/ws/events`);
+  setWsStatus("连接中…", false);
+  ws.onopen = () => setWsStatus("实时通道已连接", true);
+  ws.onmessage = (msg) => {
+    let data;
+    try { data = JSON.parse(msg.data); } catch (e) { return; }
+    if (data.kind === "event") onEvent(data.event, data.decision || {});
+    else if (data.kind === "hello" && data.engine) {
+      const c = data.engine.counters || {};
+      state.counters = {
+        total: c.total || 0, matched: c.matched || 0, alerted: c.alerted || 0,
+        rejected: Math.max(c.rejected || 0, state.counters.rejected),
+      };
+    }
+  };
+  ws.onclose = () => { setWsStatus("已断开，3 秒后重连…", false); setTimeout(connect, 3000); };
+  ws.onerror = () => setWsStatus("连接异常", false);
+}
+
+function setWsStatus(text, ok) {
+  document.getElementById("ws-status").textContent = text;
+  document.getElementById("live-dot").className = "live-dot" + (ok ? "" : " off");
+}
+
+function onEvent(ev, d) {
+  const c = state.counters;
+  c.total++;
+  if (d.matched) c.matched++;
+  const intercepted = d.action === "reject" || d.action === "review";
+  if (intercepted) c.rejected++;
+  const alerts = d.alerts || [];
+  c.alerted += alerts.length;
+
+  const ts = ev.ts || Date.now() / 1000;
+  const h = hourOf(ts);
+  const b = state.trend[h] || (state.trend[h] = { total: 0, matched: 0, rejected: 0 });
+  b.total++; if (d.matched) b.matched++; if (intercepted) b.rejected++;
+
+  if (ev.country) state.geo[ev.country] = (state.geo[ev.country] || 0) + 1;
+  if (ev.channel) state.channel[ev.channel] = (state.channel[ev.channel] || 0) + 1;
+  if (d.matched) {
+    if (ev.ip) addTop(state.topIp, ev.ip, 1, d.risk_score);
+    if (ev.user_id) addTop(state.topUser, ev.user_id, 1, d.risk_score);
+  }
+  for (const al of alerts) {
+    const fr = (d.fired_rules || []).find(f => f.rule_id === al.rule_id) || {};
+    state.alerts.unshift({
+      ts, level: al.level || "中",
+      title: fr.reason || fr.rule_name || al.rule_id,
+      ip: (al.subject || {}).ip || ev.ip,
+      user: (al.subject || {}).user_id || ev.user_id,
+      count: al.count || 1, fresh: true,
+    });
+  }
+  if (alerts.length) {
+    state.alerts = state.alerts.slice(0, 40);
+    renderTicker();
+  }
+}
+
+/* ---------------- 渲染 ---------------- */
+function tween(id, val, isPct) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const from = el._v == null ? 0 : el._v;
+  el._v = val;
+  const fmt = (v) => isPct ? v.toFixed(1) + "%" : Math.round(v).toLocaleString();
+  if (from === val) { el.textContent = fmt(val); return; }
+  const t0 = performance.now();
+  (function step(t) {
+    const p = Math.min(1, (t - t0) / 500);
+    el.textContent = fmt(from + (val - from) * p);
+    if (p < 1) requestAnimationFrame(step);
+  })(t0);
+}
+
+function renderKpis() {
+  const c = state.counters;
+  tween("kpi-total", c.total);
+  tween("kpi-matched", c.matched);
+  tween("kpi-rejected", c.rejected);
+  tween("kpi-alerted", c.alerted);
+  tween("kpi-hitrate", c.total ? c.matched / c.total * 100 : 0, true);
+  tween("kpi-rejectrate", c.total ? c.rejected / c.total * 100 : 0, true);
+}
+
+const AXIS = {
+  axisLine: { lineStyle: { color: "rgba(127,168,217,.4)" } },
+  axisLabel: { color: "#7fa8d9" },
+  splitLine: { lineStyle: { color: "rgba(127,168,217,.12)" } },
+};
+const TOOLTIP = { backgroundColor: "rgba(5,15,35,.92)", borderColor: "rgba(56,150,255,.4)", textStyle: { color: "#cfe6ff" } };
+
+function renderTrend() {
+  const ch = chart("chart-trend"); if (!ch) return;
+  const now = hourOf(Date.now() / 1000);
+  const hours = [];
+  for (let i = 23; i >= 0; i--) hours.push(now - i * HOUR);
+  const pick = (f) => hours.map(h => (state.trend[h] || {})[f] || 0);
+  ch.setOption({
+    tooltip: Object.assign({ trigger: "axis" }, TOOLTIP),
+    legend: { top: 0, textStyle: { color: "#9fc3ea" }, icon: "roundRect", itemWidth: 14 },
+    grid: { left: 48, right: 18, top: 34, bottom: 26 },
+    xAxis: {
+      type: "category", boundaryGap: true,
+      data: hours.map(h => { const d = new Date(h * 1000); return pad(d.getHours()) + ":00"; }),
+      axisLine: AXIS.axisLine, axisLabel: AXIS.axisLabel,
+    },
+    yAxis: { type: "value", axisLabel: AXIS.axisLabel, splitLine: AXIS.splitLine },
+    series: [
+      { name: "事件量", type: "bar", data: pick("total"), barMaxWidth: 16,
+        itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: "#3b82f6" }, { offset: 1, color: "rgba(59,130,246,.15)" }]) } },
+      { name: "命中", type: "line", smooth: true, data: pick("matched"), symbol: "none",
+        lineStyle: { width: 2, color: "#f59e0b" }, itemStyle: { color: "#f59e0b" } },
+      { name: "拦截", type: "line", smooth: true, data: pick("rejected"), symbol: "none",
+        lineStyle: { width: 2, color: "#ef4444" }, itemStyle: { color: "#ef4444" },
+        areaStyle: { color: "rgba(239,68,68,.12)" } },
+    ],
+  });
+}
+
+function renderGeo() {
+  const ch = chart("chart-geo"); if (!ch) return;
+  const top = Object.entries(state.geo).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  ch.setOption({
+    tooltip: Object.assign({ trigger: "item" }, TOOLTIP),
+    grid: { left: 44, right: 36, top: 8, bottom: 24 },
+    xAxis: { type: "value", axisLabel: AXIS.axisLabel, splitLine: AXIS.splitLine },
+    yAxis: {
+      type: "category", inverse: true,
+      data: top.map(t => t[0]),
+      axisLine: AXIS.axisLine, axisLabel: AXIS.axisLabel,
+    },
+    series: [{
+      type: "bar", data: top.map(t => t[1]), barWidth: 10,
+      itemStyle: { borderRadius: 4, color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [{ offset: 0, color: "#0e7490" }, { offset: 1, color: "#22d3ee" }]) },
+      label: { show: true, position: "right", color: "#7dd3fc" },
+    }],
+  });
+}
+
+function renderChannel() {
+  const ch = chart("chart-channel"); if (!ch) return;
+  const data = Object.entries(state.channel).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => ({ name: k, value: v }));
+  ch.setOption({
+    tooltip: Object.assign({ trigger: "item" }, TOOLTIP),
+    legend: { bottom: 0, textStyle: { color: "#9fc3ea" }, itemWidth: 12 },
+    color: PALETTE,
+    series: [{
+      type: "pie", radius: ["42%", "66%"], center: ["50%", "44%"],
+      itemStyle: { borderColor: "#04102a", borderWidth: 2 },
+      label: { color: "#9fc3ea", formatter: "{b} {d}%" },
+      data,
+    }],
+  });
+}
+
+function renderTop(elId, map) {
+  const el = document.getElementById(elId);
+  const rows = Object.entries(map).sort((a, b) => b[1].count - a[1].count).slice(0, 8);
+  if (!rows.length) { el.innerHTML = `<div class="rk-empty">暂无风险数据</div>`; return; }
+  const max = rows[0][1].count || 1;
+  el.innerHTML = rows.map(([key, it], i) => `
+    <div class="rk-row">
+      <span class="rk-no ${i < 3 ? "top" : ""}">${i + 1}</span>
+      <span class="rk-key" title="${UI.esc(key)}">${UI.esc(key)}</span>
+      <span class="rk-bar"><i style="width:${Math.max(4, Math.round(it.count / max * 100))}%"></i></span>
+      <span class="rk-val">${it.count}</span>
+    </div>`).join("");
+}
+
+function renderTicker() {
+  const el = document.getElementById("ticker");
+  document.getElementById("ticker-count").textContent = state.alerts.length ? `最近 ${state.alerts.length} 条` : "";
+  if (!state.alerts.length) { el.innerHTML = `<div class="tk-empty">暂无告警，系统运行平稳</div>`; return; }
+  el.innerHTML = state.alerts.map(a => `
+    <div class="tk-item lv-${UI.esc(a.level)} ${a.fresh ? "fresh" : ""}">
+      <span class="tk-time">${fmtHM(a.ts)}</span>
+      <span class="tk-level lv-${UI.esc(a.level)}">${UI.esc(a.level)}</span>
+      <div class="tk-body">
+        <div class="tk-title">${UI.esc(a.title)}</div>
+        <div class="tk-sub">${UI.esc(a.ip || "-")} · ${UI.esc(a.user || "-")}${a.count > 1 ? " · ×" + a.count : ""}</div>
+      </div>
+    </div>`).join("");
+  state.alerts.forEach(a => delete a.fresh);
+}
+
+function renderAll() {
+  renderKpis();
+  renderTrend();
+  renderGeo();
+  renderChannel();
+  renderTop("top-ip", state.topIp);
+  renderTop("top-user", state.topUser);
+}
+
+/* ---------------- 时钟 / 全屏 / 播报自动滚动 ---------------- */
+function startClock() {
+  const el = document.getElementById("clock");
+  const week = ["日", "一", "二", "三", "四", "五", "六"];
+  const tick = () => {
+    const d = new Date();
+    el.textContent = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 星期${week[d.getDay()]} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
+function setupFullscreen() {
+  document.getElementById("fs-btn").onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  };
+}
+
+function setupTickerScroll() {
+  const el = document.getElementById("ticker");
+  let hover = false;
+  el.addEventListener("mouseenter", () => hover = true);
+  el.addEventListener("mouseleave", () => hover = false);
+  setInterval(() => {
+    if (hover || el.scrollHeight <= el.clientHeight) return;
+    el.scrollTop += 1;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 1) el.scrollTop = 0;
+  }, 60);
+}
+
+/* ---------------- 启动 ---------------- */
+(async function () {
+  const user = await App.init();
+  if (!user) { location.href = "/index.html?next=" + encodeURIComponent("/screen.html"); return; }
+
+  startClock();
+  setupFullscreen();
+  setupTickerScroll();
+
+  await Promise.all([syncStats(), loadEvents(), loadAlerts()]);
+  renderAll();
+  connect();
+
+  // 渲染节拍：WS 增量先落状态，这里统一刷新视图
+  setInterval(() => { if (!document.hidden) renderAll(); }, 1500);
+  // 权威校准：计数器/趋势每 5s，告警与 Top 榜每 30s
+  setInterval(() => { if (!document.hidden) syncStats(); }, 5000);
+  setInterval(() => { if (!document.hidden) loadAlerts(); }, 30000);
+})();
+</script>
+</body>
+</html>
